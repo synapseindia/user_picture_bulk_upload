@@ -1,0 +1,174 @@
+<?php
+
+/**
+ * Implements hook_help().
+ */
+function user_picture_bulk_upload_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#user_picture_bulk_upload':
+      $output = '';
+			$output .= '<h3>'.t('About').'</h3>';
+			$output .= '<p>'.t('User Picture Bulk Upload module help to upload user profile image and avatar.').'</p>';
+			$output .= '<p>'.t('This module helps to update the user profile image on the basis of UID.').'</p>';
+			$output .= '<p>'.t('Sometime you need to update the user profile image from any external source, then this will helps in mapping the external image url with UID and update the profile image.').'</p>';
+      return $output;
+	}
+}
+
+/**
+ * Implement hook_menu()
+ */
+function user_picture_bulk_upload_menu() {
+  $items = array();
+  $items['admin/config/configuration/user_picture_upload'] = array(
+    'title' => 'User Picture Bulk Upload',
+		'page callback' => 'drupal_get_form',
+		'page arguments' => array('user_picture_bulk_upload'), 
+    'access callback' => 'user_access',
+    'access arguments' => array('administer users'),
+  );
+  return $items;
+}
+
+/**
+ * Implement callback user_picture_bulk_upload()
+ */
+function user_picture_bulk_upload($form, &$form_state) {
+  $filename = "user_picture_bulk_upload.csv";
+  $modified_date = db_query('SELECT f.timestamp FROM {file_managed} f WHERE f.filename = :filename', array(':filename' => $filename))->fetchField();
+  $form['user_picture_csv'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('User Picture Bulk Upload'),
+    '#collapsible' => True,
+    '#collapsed' => False,
+    '#tree' => TRUE,
+  );
+
+  $form['user_picture_csv']['upload_csv'] = array(
+    '#type' => 'managed_file',
+    '#title' => t('User CSV File'),
+    '#description' => t('Upload CSV file which contain two column "UID" and "Picture URL". See <a href="@sample-handbook">Sample</a>.', array('@sample-handbook' => url(drupal_get_path("module", "user_picture_bulk_upload").'/files/sample.csv'))),
+    '#required' => TRUE,
+    '#upload_validators' => array(
+      'file_validate_extensions' => array('csv'),
+    ),
+  );
+
+  $form['user_picture_csv']['actions']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Import'),
+  );
+
+	if($modified_date){
+    $form['user_picture_csv']['markup'] = array(
+      '#type' => 'markup',
+      '#markup' => '<div>Last User Picture import was done on <span>'.format_date($modified_date, 'custom','m-d-Y \a\t h:i A', 'America/Los_Angeles').'</span></div>',
+    );
+	}
+  return $form;
+}
+
+/**
+ * Form submit handler
+ */
+function user_picture_bulk_upload_submit($form, &$form_state) {
+  $upload_csv_fid = $form_state['values']['user_picture_csv']['upload_csv'];
+  $file = file_load($upload_csv_fid);
+  $file->status = FILE_STATUS_PERMANENT;
+  $file->filename = "user_picture_bulk_upload.csv";
+  $filename_public = 'public://user_picture_bulk_upload.csv';
+  $file = file_move($file, $filename_public, $replace = FILE_EXISTS_REPLACE);
+  file_save($file);
+ 	$csv_uri = $file->uri;
+ 	$_SESSION['http_request_count'] = 0; // reset counter for debug information.
+  //Batch Process initialize
+  $batch = array(
+    'operations' => array(),
+    'finished' => 'user_picture_bulk_batch_fix_finished',
+    'title' => t('Picture Update'),
+    'init_message' => t('Update is starting...'),
+    'progress_message' => t('Processed @current out of @total.'),
+    'error_message' => t('Picture Update has encountered an error.')
+  );
+	//open csv file in read mode
+	if($handle = fopen($csv_uri, 'r')){
+		$row = fgetcsv($handle, 0, ",");
+		$columns = array();
+		foreach ($row as $i => $header) {
+			$columns[$i] = trim($header);
+		}
+		while ($line_data = fgetcsv($handle, 0, ",")) {
+			if(!empty($line_data[0]) && !empty($line_data[1])){
+        $batch['operations'][] = array('user_picture_bulk_upload_process', array($line_data));
+			}
+		}
+		fclose($handle);
+	}
+	batch_set($batch);
+	batch_process('admin/config/configuration/user_picture_upload');
+}
+
+function user_picture_bulk_upload_process($line_data, &$context){
+  $data_uid = !empty($line_data[0]) ? $line_data[0] : '' ;
+  $data_url = !empty($line_data[1]) ? $line_data[1] : '' ;
+  if($data_uid != '' && $data_url != '' ){
+    $account = user_load($data_uid);
+    if(is_object($account)){
+      //Get file type & name
+      $path = parse_url($data_url, PHP_URL_PATH);
+      $extension = pathinfo($path, PATHINFO_EXTENSION);
+      $destination_filename = "picture-" .$account->uid. "." . $extension;
+      //Get picture directory path
+      $picture_directory = 'public://' . variable_get('user_picture_path', 'pictures');
+      $destination_uri = $picture_directory . '/' . $destination_filename;
+      drupal_mkdir(drupal_dirname($destination_uri,null,true));
+      //Get image from URL
+      $arrContextOptions=array(
+        "ssl"=>array(
+          "verify_peer"=>false,
+          "verify_peer_name"=>false,
+        ),
+      );
+      $image = file_get_contents($data_url, false, stream_context_create($arrContextOptions));
+      try{
+        if($image === false){
+				  return;
+        }else {
+			    image_path_flush($destination_uri);
+          $picture_file = file_save_data($image, $destination_uri, FILE_EXISTS_REPLACE);
+          // Update the user record.
+          $picture_file->uid = $account->uid;
+          $picture_file = file_save($picture_file);
+          file_usage_add($picture_file, 'user', 'user', $account->uid);
+          db_update('users')
+            ->fields(array(
+              'picture' => $picture_file->fid,
+            ))
+            ->condition('uid', $account->uid)
+            ->execute();
+          $account->picture = $picture_file->fid;
+        }
+			} catch (Exception $e) {
+          // Handle exception here
+      }
+    }
+  }
+}
+
+/**
+ * The batch finish handler.
+ */
+function user_picture_bulk_batch_fix_finished($success, $results, $operations) {
+  if ($success) {
+    drupal_set_message('Upload is complete!');
+  }
+  else {
+    $error_operation = reset($operations);
+    $message = t('An error occurred while processing %error_operation with arguments: @arguments', array(
+      '%error_operation' => $error_operation[0],
+      '@arguments' => print_r($error_operation[1], TRUE)
+    ));
+    drupal_set_message($message, 'error');
+  }
+  return t('User Bulk picture upload done');
+}
